@@ -7,7 +7,7 @@ from io import BytesIO
 
 # --- 1. 页面基础设置 ---
 st.set_page_config(page_title="直播数据分析看板", layout="wide", page_icon="📊")
-st.title("📊 直播间主播能力评估系统 (完整功能版)")
+st.title("📊 直播间主播能力评估系统 (双向智能筛选版)")
 
 # --- 2. 侧边栏：数据读取模块 ---
 st.sidebar.header("1. 数据导入")
@@ -53,7 +53,6 @@ if file_obj:
         if is_excel:
             st.sidebar.markdown("---")
             sheet = st.sidebar.selectbox("2. 选择直播间 (Sheet工作表)", excel_file.sheet_names)
-            # 表头默认值设为 1
             header_idx = st.sidebar.number_input("表头在第几行? (0代表第1行, 1代表第2行)", value=1, min_value=0)
             df_raw = pd.read_excel(excel_file, sheet_name=sheet, header=header_idx)
         else:
@@ -76,7 +75,6 @@ if file_obj:
         c_sale = st.sidebar.selectbox("📦 选择 [成交订单数] 列", cols, index=find_idx(['订单','数量','销量','Sales'], 4))
         
         st.sidebar.markdown("---")
-        # 默认客单价 3299
         price = st.sidebar.number_input("💰 设定客单价 (元)", value=3299.0, step=100.0)
 
         # C. 数据清洗与计算
@@ -114,50 +112,120 @@ if file_obj:
         df = df[df['Name'].astype(str).str.strip() != '']
         df = df[df['Cost'] > 0] 
 
-        # D. 筛选器逻辑
+        # D. 双向智能筛选逻辑
         st.sidebar.markdown("---")
         st.sidebar.header("4. 数据筛选")
-        
-        # 1. 日期筛选
+
+        # --- 基础：日期筛选 ---
         min_d, max_d = df['Date'].min(), df['Date'].max()
         def_start = date(2026, 1, 1)
         start_val = def_start if (min_d < def_start <= max_d) else min_d
         
         sel_date = st.sidebar.date_input(
-            "📆 选择日期范围", 
+            "1️⃣ 选日期范围", 
             [start_val, max_d], 
             min_value=min_d, 
             max_value=max_d,
             format="YYYY-MM-DD"
         )
         
-        # 2. 【新增】小时筛选
-        # 对小时进行排序 (6:00, 7:00...)
-        all_hours = sorted(df['Hour'].unique(), key=lambda x: int(x.split(':')[0]))
-        sel_hours = st.sidebar.multiselect(
-            "⏰ 选择具体小时段 (可剔除垃圾时间)",
-            all_hours,
-            default=all_hours
-        )
-
-        # 组合筛选条件
+        # 锁定日期范围内的数据
         mask_date = pd.Series([True]*len(df))
         if isinstance(sel_date, tuple) and len(sel_date) == 2:
             mask_date = (df['Date'] >= sel_date[0]) & (df['Date'] <= sel_date[1])
+        df_period = df[mask_date]
         
-        mask_hour = df['Hour'].isin(sel_hours)
-        
-        temp_df = df[mask_date & mask_hour]
-        
-        if temp_df.empty:
-            st.warning("⚠️ 所选日期或时间段内没有数据。")
+        if df_period.empty:
+            st.sidebar.warning("⚠️ 该日期范围内无数据")
             st.stop()
+
+        # --- 核心：筛选模式切换 ---
+        st.sidebar.markdown("---")
+        filter_mode = st.sidebar.radio(
+            "🔀 筛选主导模式 (决定谁过滤谁)",
+            ["按时间找人 (默认)", "按人找时间"],
+            help="按时间找人：选了时间，只显示该时间有班的人。\n按人找时间：选了人，只显示该人上播的时间。"
+        )
+
+        final_df = pd.DataFrame()
+
+        if filter_mode == "按时间找人 (默认)":
+            # 逻辑：先选小时 -> 再选主播
             
-        # 3. 主播筛选 (基于上方筛选后的数据)
-        valid_names = sorted(temp_df['Name'].unique().astype(str))
-        sel_names = st.sidebar.multiselect("👥 选择主播", valid_names, default=valid_names)
-        
-        final_df = temp_df[temp_df['Name'].isin(sel_names)]
+            # Step 1: 选小时
+            available_hours = sorted(df_period['Hour'].unique(), key=lambda x: int(x.split(':')[0]))
+            container_hour = st.sidebar.container()
+            all_hours = container_hour.checkbox("全选时间点", value=True, key="cb_h1")
+            
+            if all_hours:
+                sel_hours = container_hour.multiselect("2️⃣ 选时间点", available_hours, default=available_hours)
+            else:
+                sel_hours = container_hour.multiselect("2️⃣ 选时间点", available_hours)
+            
+            if not sel_hours:
+                st.sidebar.warning("请至少选择一个时间点")
+                st.stop()
+            
+            # 过滤出符合时间的数据
+            df_step1 = df_period[df_period['Hour'].isin(sel_hours)]
+            
+            if df_step1.empty:
+                st.sidebar.warning("所选时间段无数据")
+                st.stop()
+
+            # Step 2: 选主播 (基于上面的时间数据)
+            # 这里的 available_streamers 只包含在所选时间上过播的人
+            available_streamers = sorted(df_step1['Name'].unique().astype(str))
+            
+            container_name = st.sidebar.container()
+            all_names = container_name.checkbox("全选主播", value=True, key="cb_n1")
+            
+            if all_names:
+                sel_names = container_name.multiselect("3️⃣ 选主播 (自动过滤未上播人员)", available_streamers, default=available_streamers)
+            else:
+                sel_names = container_name.multiselect("3️⃣ 选主播", available_streamers)
+                
+            final_df = df_step1[df_step1['Name'].isin(sel_names)]
+
+        else:
+            # 逻辑：先选主播 -> 再选小时 (顺序调换，布局依然保持上下，但逻辑反转)
+            
+            # Step 1: 选主播 (基于日期数据)
+            available_streamers = sorted(df_period['Name'].unique().astype(str))
+            
+            container_name = st.sidebar.container()
+            all_names = container_name.checkbox("全选主播", value=True, key="cb_n2")
+            
+            # 为了布局好看，我们把主播选择放上面，时间放下面
+            if all_names:
+                sel_names = container_name.multiselect("2️⃣ 选主播", available_streamers, default=available_streamers)
+            else:
+                sel_names = container_name.multiselect("2️⃣ 选主播", available_streamers)
+                
+            if not sel_names:
+                st.sidebar.warning("请至少选择一位主播")
+                st.stop()
+            
+            # 过滤出符合主播的数据
+            df_step1 = df_period[df_period['Name'].isin(sel_names)]
+            
+            # Step 2: 选小时 (基于上面的主播数据)
+            # 这里的 available_hours 只包含所选主播上过播的时间点
+            if df_step1.empty:
+                st.sidebar.warning("所选主播在此期间无排班")
+                st.stop()
+
+            available_hours = sorted(df_step1['Hour'].unique(), key=lambda x: int(x.split(':')[0]))
+            
+            container_hour = st.sidebar.container()
+            all_hours = container_hour.checkbox("全选时间点", value=True, key="cb_h2")
+            
+            if all_hours:
+                sel_hours = container_hour.multiselect("3️⃣ 选时间点 (自动过滤没播的时间)", available_hours, default=available_hours)
+            else:
+                sel_hours = container_hour.multiselect("3️⃣ 选时间点", available_hours)
+                
+            final_df = df_step1[df_step1['Hour'].isin(sel_hours)]
 
         # E. 结果展示
         if not final_df.empty:
@@ -213,7 +281,7 @@ if file_obj:
             
             sorted_df = display_df.sort_values(sort_key_cn, ascending=ascending_order)
             
-            # 表格样式：纯数字，无进度条
+            # 表格样式
             st.dataframe(
                 sorted_df,
                 column_config={
